@@ -7,16 +7,19 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules import (AIFI, C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x,
+from ultralytics.nn.modules import (AIFI, C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C2fGhost, C3Ghost, C3x,
                                     Classify, Concat, Conv, Conv2, ConvTranspose, Detect, DWConv, DWConvTranspose2d,
                                     Focus, GhostBottleneck, GhostConv, HGBlock, HGStem, Pose, RepC3, RepConv,
-                                    RTDETRDecoder, Segment)
+                                    RTDETRDecoder, Segment, CARAFE, SPPFCSPC, SimSPPF, NAMAttention, C2f_DCN, Bottleneck_DCN, Focus, ShuffleAttention, ECAAttention, SEAttention, GAMAttention, SPPCSPC_group, SPPCSPC, GhostSPPCSPC)
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8PoseLoss, v8SegmentationLoss
 from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (fuse_conv_and_bn, fuse_deconv_and_bn, initialize_weights, intersect_dicts,
                                            make_divisible, model_info, scale_img, time_sync)
+
+from ultralytics.nn.exp.CoT import CoT3
+from ultralytics.nn.exp.ODConv import ODConv
 
 try:
     import thop
@@ -25,11 +28,14 @@ except ImportError:
 
 
 class BaseModel(nn.Module):
-    """The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family."""
+    """
+    The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family.
+    """
 
     def forward(self, x, *args, **kwargs):
         """
-        Forward pass of the model on a single scale. Wrapper for `_forward_once` method.
+        Forward pass of the model on a single scale.
+        Wrapper for `_forward_once` method.
 
         Args:
             x (torch.Tensor | dict): The input image tensor or a dict including image tensor and gt labels.
@@ -90,8 +96,8 @@ class BaseModel(nn.Module):
 
     def _profile_one_layer(self, m, x, dt):
         """
-        Profile the computation time and FLOPs of a single layer of the model on a given input. Appends the results to
-        the provided list.
+        Profile the computation time and FLOPs of a single layer of the model on a given input.
+        Appends the results to the provided list.
 
         Args:
             m (nn.Module): The layer to be profiled.
@@ -155,7 +161,7 @@ class BaseModel(nn.Module):
 
     def info(self, detailed=False, verbose=True, imgsz=640):
         """
-        Prints model information.
+        Prints model information
 
         Args:
             detailed (bool): if True, prints out detailed information about the model. Defaults to False
@@ -172,7 +178,7 @@ class BaseModel(nn.Module):
             fn (function): the function to apply to the model
 
         Returns:
-            (BaseModel): An updated BaseModel object.
+            A model that is a Detect() object.
         """
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
@@ -199,7 +205,7 @@ class BaseModel(nn.Module):
 
     def loss(self, batch, preds=None):
         """
-        Compute loss.
+        Compute loss
 
         Args:
             batch (dict): Batch to compute loss on
@@ -212,7 +218,6 @@ class BaseModel(nn.Module):
         return self.criterion(preds, batch)
 
     def init_criterion(self):
-        """Initialize the loss criterion for the BaseModel."""
         raise NotImplementedError('compute_loss() needs to be implemented by task heads')
 
 
@@ -220,7 +225,6 @@ class DetectionModel(BaseModel):
     """YOLOv8 detection model."""
 
     def __init__(self, cfg='yolov8n.yaml', ch=3, nc=None, verbose=True):  # model, input channels, number of classes
-        """Initialize the YOLOv8 detection model with the given config and parameters."""
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
 
@@ -228,7 +232,7 @@ class DetectionModel(BaseModel):
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
         if nc and nc != self.yaml['nc']:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
-            self.yaml['nc'] = nc  # override YAML value
+            self.yaml['nc'] = nc  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
         self.names = {i: f'{i}' for i in range(self.yaml['nc'])}  # default names dict
         self.inplace = self.yaml.get('inplace', True)
@@ -260,6 +264,7 @@ class DetectionModel(BaseModel):
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
             yi = super().predict(xi)[0]  # forward
+            # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
@@ -277,7 +282,7 @@ class DetectionModel(BaseModel):
         return torch.cat((x, y, wh, cls), dim)
 
     def _clip_augmented(self, y):
-        """Clip YOLO augmented inference tails."""
+        """Clip YOLOv5 augmented inference tails."""
         nl = self.model[-1].nl  # number of detection layers (P3-P5)
         g = sum(4 ** x for x in range(nl))  # grid points
         e = 1  # exclude layer count
@@ -288,7 +293,6 @@ class DetectionModel(BaseModel):
         return y
 
     def init_criterion(self):
-        """Initialize the loss criterion for the DetectionModel."""
         return v8DetectionLoss(self)
 
 
@@ -300,7 +304,6 @@ class SegmentationModel(DetectionModel):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
-        """Initialize the loss criterion for the SegmentationModel."""
         return v8SegmentationLoss(self)
 
 
@@ -317,17 +320,37 @@ class PoseModel(DetectionModel):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
-        """Initialize the loss criterion for the PoseModel."""
         return v8PoseLoss(self)
 
 
 class ClassificationModel(BaseModel):
     """YOLOv8 classification model."""
 
-    def __init__(self, cfg='yolov8n-cls.yaml', ch=3, nc=None, verbose=True):
-        """Init ClassificationModel with YAML, channels, number of classes, verbose flag."""
+    def __init__(self,
+                 cfg='yolov8n-cls.yaml',
+                 model=None,
+                 ch=3,
+                 nc=None,
+                 cutoff=10,
+                 verbose=True):  # yaml, model, channels, number of classes, cutoff index, verbose flag
         super().__init__()
-        self._from_yaml(cfg, ch, nc, verbose)
+        self._from_detection_model(model, nc, cutoff) if model is not None else self._from_yaml(cfg, ch, nc, verbose)
+
+    def _from_detection_model(self, model, nc=1000, cutoff=10):
+        """Create a YOLOv5 classification model from a YOLOv5 detection model."""
+        from ultralytics.nn.autobackend import AutoBackend
+        if isinstance(model, AutoBackend):
+            model = model.model  # unwrap DetectMultiBackend
+        model.model = model.model[:cutoff]  # backbone
+        m = model.model[-1]  # last layer
+        ch = m.conv.in_channels if hasattr(m, 'conv') else m.cv1.conv.in_channels  # ch into module
+        c = Classify(ch, nc)  # Classify()
+        c.i, c.f, c.type = m.i, m.f, 'models.common.Classify'  # index, from, type
+        model.model[-1] = c  # replace
+        self.model = model.model
+        self.stride = model.stride
+        self.save = []
+        self.nc = nc
 
     def _from_yaml(self, cfg, ch, nc, verbose):
         """Set YOLOv8 model configurations and define the model architecture."""
@@ -337,7 +360,7 @@ class ClassificationModel(BaseModel):
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
         if nc and nc != self.yaml['nc']:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
-            self.yaml['nc'] = nc  # override YAML value
+            self.yaml['nc'] = nc  # override yaml value
         elif not nc and not self.yaml.get('nc', None):
             raise ValueError('nc not specified. Must specify nc in model.yaml or function arguments.')
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
@@ -367,59 +390,22 @@ class ClassificationModel(BaseModel):
                     m[i] = nn.Conv2d(m[i].in_channels, nc, m[i].kernel_size, m[i].stride, bias=m[i].bias is not None)
 
     def init_criterion(self):
-        """Initialize the loss criterion for the ClassificationModel."""
+        """Compute the classification loss between predictions and true labels."""
         return v8ClassificationLoss()
 
 
 class RTDETRDetectionModel(DetectionModel):
-    """
-    RTDETR (Real-time DEtection and Tracking using Transformers) Detection Model class.
-
-    This class is responsible for constructing the RTDETR architecture, defining loss functions, and facilitating both
-    the training and inference processes. RTDETR is an object detection and tracking model that extends from the
-    DetectionModel base class.
-
-    Attributes:
-        cfg (str): The configuration file path or preset string. Default is 'rtdetr-l.yaml'.
-        ch (int): Number of input channels. Default is 3 (RGB).
-        nc (int, optional): Number of classes for object detection. Default is None.
-        verbose (bool): Specifies if summary statistics are shown during initialization. Default is True.
-
-    Methods:
-        init_criterion: Initializes the criterion used for loss calculation.
-        loss: Computes and returns the loss during training.
-        predict: Performs a forward pass through the network and returns the output.
-    """
 
     def __init__(self, cfg='rtdetr-l.yaml', ch=3, nc=None, verbose=True):
-        """
-        Initialize the RTDETRDetectionModel.
-
-        Args:
-            cfg (str): Configuration file name or path.
-            ch (int): Number of input channels.
-            nc (int, optional): Number of classes. Defaults to None.
-            verbose (bool, optional): Print additional information during initialization. Defaults to True.
-        """
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
-        """Initialize the loss criterion for the RTDETRDetectionModel."""
+        """Compute the classification loss between predictions and true labels."""
         from ultralytics.models.utils.loss import RTDETRDetectionLoss
 
         return RTDETRDetectionLoss(nc=self.nc, use_vfl=True)
 
     def loss(self, batch, preds=None):
-        """
-        Compute the loss for the given batch of data.
-
-        Args:
-            batch (dict): Dictionary containing image and label data.
-            preds (torch.Tensor, optional): Precomputed model predictions. Defaults to None.
-
-        Returns:
-            (tuple): A tuple containing the total loss and main three losses in a tensor.
-        """
         if not hasattr(self, 'criterion'):
             self.criterion = self.init_criterion()
 
@@ -456,17 +442,16 @@ class RTDETRDetectionModel(DetectionModel):
 
     def predict(self, x, profile=False, visualize=False, batch=None, augment=False):
         """
-        Perform a forward pass through the model.
+        Perform a forward pass through the network.
 
         Args:
-            x (torch.Tensor): The input tensor.
-            profile (bool, optional): If True, profile the computation time for each layer. Defaults to False.
-            visualize (bool, optional): If True, save feature maps for visualization. Defaults to False.
-            batch (dict, optional): Ground truth data for evaluation. Defaults to None.
-            augment (bool, optional): If True, perform data augmentation during inference. Defaults to False.
+            x (torch.Tensor): The input tensor to the model
+            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            visualize (bool): Save the feature maps of the model if True, defaults to False
+            batch (dict): A dict including gt boxes and labels from dataloader.
 
         Returns:
-            (torch.Tensor): Model's output tensor.
+            (torch.Tensor): The last output of the model.
         """
         y, dt = [], []  # outputs
         for m in self.model[:-1]:  # except the head part
@@ -491,7 +476,7 @@ class Ensemble(nn.ModuleList):
         super().__init__()
 
     def forward(self, x, augment=False, profile=False, visualize=False):
-        """Function generates the YOLO network's final layer."""
+        """Function generates the YOLOv5 network's final layer."""
         y = [module(x, augment, profile, visualize)[0] for module in self]
         # y = torch.stack(y).max(0)[0]  # max ensemble
         # y = torch.stack(y).mean(0)  # mean ensemble
@@ -683,13 +668,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in (Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, Focus,
-                 BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3):
+                 BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3, C2fGhost, CARAFE, SPPFCSPC, SimSPPF, C2f_DCN, Bottleneck_DCN, Focus, SEAttention, GAMAttention, CoT3, SPPCSPC_group, SPPCSPC, GhostSPPCSPC):
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in (BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C3x, RepC3):
+            if m in (BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C3x, RepC3, C2fGhost ):
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is AIFI:
@@ -700,7 +685,28 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             if m is HGBlock:
                 args.insert(4, n)  # number of repeats
                 n = 1
-
+        ##add shuffle attention
+        elif m is ShuffleAttention:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, *args[1:]]
+        ##add ECA attention
+        elif m is ECAAttention:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, *args[1:]]
+        
+        #add ODconv        
+        elif m in [ODConv]:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:  # if not output
+                c2 = make_divisible(c2 * width, 8)
+            args = [c1, c2, *args[1:]]
+        
+        
+        
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
@@ -748,9 +754,9 @@ def yaml_model_load(path):
 
 def guess_model_scale(model_path):
     """
-    Takes a path to a YOLO model's YAML file as input and extracts the size character of the model's scale. The function
-    uses regular expression matching to find the pattern of the model scale in the YAML file name, which is denoted by
-    n, s, m, l, or x. The function returns the size character of the model scale as a string.
+    Takes a path to a YOLO model's YAML file as input and extracts the size character of the model's scale.
+    The function uses regular expression matching to find the pattern of the model scale in the YAML file name,
+    which is denoted by n, s, m, l, or x. The function returns the size character of the model scale as a string.
 
     Args:
         model_path (str | Path): The path to the YOLO model's YAML file.
